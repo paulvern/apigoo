@@ -805,6 +805,17 @@ async def startup_event():
     print("📖 Alternative docs: http://localhost:8000/redoc")
     print("="*60 + "\n")
 
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    import os
+    
+    # Railway fornisce la variabile PORT
+    port = int(os.environ.get("PORT", 8000))
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info"
+    )
