@@ -10,8 +10,6 @@ from pathlib import Path
 import gdown
 import json
 from enum import Enum
-import os
-# ===== CONFIGURAZIONE GLOBALE =====
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
 MAX_FILES = int(os.environ.get("MAX_FILES", "5"))
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
@@ -800,65 +798,21 @@ def load_datasets():
     
     print("✅ All datasets loaded successfully!")
 
-
 @app.on_event("startup")
 async def startup_event():
-    """Eseguito all'avvio del server - UNA VOLTA SOLA"""
-    global _startup_complete
-    
-    # Evita esecuzioni multiple
-    if _startup_complete:
-        print("⚠️  Startup already completed, skipping...")
-        return
-    
+    """Eseguito all'avvio del server"""
+    print("\n" + "="*60)
+    print("🚀 Starting CSV Data API Server...")
     print("="*60)
-    print("🚀 Starting CSV Data API")
+    load_datasets()
     print("="*60)
-    
-    try:
-        # Verifica se ci sono CSV
-        data_dir = Path("data")
-        if not data_dir.exists():
-            print(f"📁 Creating data directory...")
-            data_dir.mkdir(exist_ok=True)
-        
-        csv_files = list(data_dir.glob("*.csv"))
-        
-        if len(csv_files) == 0:
-            print("⚠️  No CSV files found in data/ directory")
-            print("💡 Upload CSV files to get started")
-        else:
-            print(f"📊 Found {len(csv_files)} CSV file(s)")
-            
-            # Carica solo se ci sono file
-            for csv_file in csv_files[:5]:  # Limita a max 5 file
-                try:
-                    file_size = csv_file.stat().st_size / (1024*1024)  # MB
-                    print(f"   Loading {csv_file.name} ({file_size:.2f} MB)...")
-                    
-                    # Salta file troppo grandi (> 50MB)
-                    if file_size > 50:
-                        print(f"   ⚠️  Skipping {csv_file.name}: too large (>{50}MB)")
-                        continue
-                    
-                    data_manager.add_csv_from_file(
-                        table_name=csv_file.stem,
-                        file_path=str(csv_file)
-                    )
-                except Exception as e:
-                    print(f"   ❌ Error loading {csv_file.name}: {e}")
-                    continue
-        
-        print("="*60)
-        print(f"✅ Loaded {len(data_manager.tables)} table(s)")
-        print("="*60)
-        
-        _startup_complete = True
-        
-    except Exception as e:
-        print(f"❌ Startup error: {e}")
-        print("⚠️  Starting server without data...")
-        _startup_complete = True  # Continua comunque
+    print("📚 API Documentation: http://localhost:8000/docs")
+    print("📖 Alternative docs: http://localhost:8000/redoc")
+    print("="*60 + "\n")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
 
