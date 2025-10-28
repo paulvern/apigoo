@@ -11,7 +11,13 @@ import gdown
 import json
 from enum import Enum
 import os
+# ===== CONFIGURAZIONE GLOBALE =====
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
+MAX_FILES = int(os.environ.get("MAX_FILES", "5"))
+DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 
+# ⚠️ IMPORTANTE: Flag globale per evitare loop di startup
+_startup_complete = False  # DEVE ESSERE QUI, PRIMA DI TUTTO
 # ===== MODELLI PYDANTIC =====
 
 class AggregationType(str, Enum):
@@ -853,5 +859,6 @@ async def startup_event():
         print(f"❌ Startup error: {e}")
         print("⚠️  Starting server without data...")
         _startup_complete = True  # Continua comunque
+
 
 
