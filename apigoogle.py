@@ -786,7 +786,7 @@ def load_datasets():
     # Esempio 1: CSV da Google Drive
     data_manager.add_csv_from_gdrive(
          table_name="pollini",
-         gdrive_url="https://drive.google.com/file/d/1L0632m5gY4kDdvv5X8oey09VtijujtpH/view?usp=sharing",
+         gdrive_url="https://drive.google.com/file/d/1BJrfprXh1picyTQusVO6oW5zRxWQ_up7/view?usp=sharing",
          date_column="reftime"
      )
     
@@ -814,6 +814,7 @@ async def startup_event():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
