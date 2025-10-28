@@ -10,6 +10,7 @@ from pathlib import Path
 import gdown
 import json
 from enum import Enum
+import os
 
 # ===== MODELLI PYDANTIC =====
 
@@ -852,4 +853,5 @@ async def startup_event():
         print(f"❌ Startup error: {e}")
         print("⚠️  Starting server without data...")
         _startup_complete = True  # Continua comunque
+
 
