@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import List, Optional, Dict, Any, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, HttpUrl
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -10,13 +10,13 @@ from pathlib import Path
 import gdown
 import json
 import os
+import hashlib
 from enum import Enum
+
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
 MAX_FILES = int(os.environ.get("MAX_FILES", "5"))
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 
-# ⚠️ IMPORTANTE: Flag globale per evitare loop di startup
-_startup_complete = False  # DEVE ESSERE QUI, PRIMA DI TUTTO
 # ===== MODELLI PYDANTIC =====
 
 class AggregationType(str, Enum):
@@ -55,12 +55,34 @@ class FilterCondition(BaseModel):
             }
         }
 
+# 🆕 NUOVO: Modello per caricare CSV
+class LoadCSVRequest(BaseModel):
+    """Richiesta per caricare un nuovo CSV"""
+    table_name: str = Field(..., description="Nome da assegnare alla tabella", example="my_data")
+    gdrive_url: str = Field(..., description="URL pubblico di Google Drive", example="https://drive.google.com/file/d/ABC123/view")
+    date_column: Optional[str] = Field(None, description="Nome della colonna con le date (opzionale)", example="date")
+    overwrite: bool = Field(False, description="Sovrascrivi se la tabella esiste già")
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "table_name": "pollution_data",
+                "gdrive_url": "https://drive.google.com/file/d/1BJrfprXh1picyTQusVO6oW5zRxWQ_up7/view?usp=sharing",
+                "date_column": "reftime",
+                "overwrite": False
+            }
+        }
+
 class QueryRequest(BaseModel):
     """Richiesta di query con filtri avanzati"""
     columns: Optional[List[str]] = Field(None, description="Colonne da selezionare")
     filters: Optional[List[FilterCondition]] = Field(None, description="Condizioni di filtro")
     limit: int = Field(100, ge=1, le=10000, description="Numero massimo di risultati")
     offset: int = Field(0, ge=0, description="Offset per paginazione")
+    
+    # 🆕 OPZIONALE: Carica CSV al volo
+    gdrive_url: Optional[str] = Field(None, description="URL Google Drive (carica al volo se non in cache)")
+    date_column_hint: Optional[str] = Field(None, description="Colonna date per CSV caricato al volo")
     
     class Config:
         schema_extra = {
@@ -82,6 +104,10 @@ class AggregationRequest(BaseModel):
     filters: Optional[List[FilterCondition]] = Field(None, description="Filtri da applicare prima dell'aggregazione")
     days: Optional[int] = Field(None, ge=1, le=365, description="Finestra mobile in giorni")
     yearly_average: bool = Field(False, description="Calcola media annuale per giorno")
+    
+    # 🆕 OPZIONALE: Carica CSV al volo
+    gdrive_url: Optional[str] = Field(None, description="URL Google Drive (carica al volo se non in cache)")
+    date_column_hint: Optional[str] = Field(None, description="Colonna date per CSV caricato al volo")
     
     class Config:
         schema_extra = {
@@ -105,6 +131,35 @@ class DataManager:
         self.tables: Dict[str, pd.DataFrame] = {}
         self.schemas: Dict[str, Dict[str, str]] = {}
         self.date_columns: Dict[str, Optional[str]] = {}
+        # 🆕 Cache per tracciare l'origine dei dati
+        self.table_sources: Dict[str, str] = {}  # table_name -> gdrive_url
+        self.url_cache: Dict[str, str] = {}  # url_hash -> table_name
+        
+    def _hash_url(self, url: str) -> str:
+        """Genera hash univoco per URL"""
+        return hashlib.md5(url.encode()).hexdigest()[:12]
+    
+    def get_or_load_from_url(self, gdrive_url: str, date_column: Optional[str] = None) -> str:
+        """
+        🆕 Carica un CSV da URL o restituisce il nome della tabella se già in cache
+        
+        Returns:
+            Nome della tabella caricata
+        """
+        url_hash = self._hash_url(gdrive_url)
+        
+        # Controlla se già in cache
+        if url_hash in self.url_cache:
+            table_name = self.url_cache[url_hash]
+            print(f"♻️ Using cached table '{table_name}' for URL")
+            return table_name
+        
+        # Carica nuovo CSV
+        table_name = f"temp_{url_hash}"
+        self.add_csv_from_gdrive(table_name, gdrive_url, date_column)
+        self.url_cache[url_hash] = table_name
+        
+        return table_name
         
     def add_csv_from_gdrive(self, table_name: str, gdrive_url: str, date_column: Optional[str] = None):
         """
@@ -133,6 +188,9 @@ class DataManager:
             
             # Carica il CSV
             self.add_csv_from_file(table_name, output_path, date_column)
+            
+            # 🆕 Salva l'origine
+            self.table_sources[table_name] = gdrive_url
             
             # Rimuovi il file temporaneo
             Path(output_path).unlink(missing_ok=True)
@@ -169,6 +227,29 @@ class DataManager:
             
         except Exception as e:
             raise Exception(f"Error loading {table_name}: {str(e)}")
+    
+    def remove_table(self, table_name: str) -> bool:
+        """🆕 Rimuove una tabella dalla memoria"""
+        if table_name not in self.tables:
+            return False
+        
+        # Rimuovi da tutte le strutture dati
+        del self.tables[table_name]
+        del self.schemas[table_name]
+        
+        if table_name in self.date_columns:
+            del self.date_columns[table_name]
+        
+        if table_name in self.table_sources:
+            # Rimuovi anche dalla URL cache
+            url = self.table_sources[table_name]
+            url_hash = self._hash_url(url)
+            if url_hash in self.url_cache:
+                del self.url_cache[url_hash]
+            del self.table_sources[table_name]
+        
+        print(f"🗑️ Removed table '{table_name}'")
+        return True
     
     def _generate_schema(self, table_name: str):
         """Genera lo schema della tabella con i tipi di dato"""
@@ -237,7 +318,8 @@ class DataManager:
                 "name": name,
                 "rows": len(df),
                 "columns": len(df.columns),
-                "date_column": self.date_columns.get(name)
+                "date_column": self.date_columns.get(name),
+                "source": self.table_sources.get(name, "unknown")  # 🆕
             }
             for name, df in self.tables.items()
         ]
@@ -473,9 +555,16 @@ class DataManager:
 # ===== INIZIALIZZAZIONE FASTAPI =====
 
 app = FastAPI(
-    title="CSV Data API",
+    title="CSV Data API - Dynamic Loader",
     description="""
-    🚀 **API per interrogare dataset CSV da Google Drive**
+    🚀 **API per interrogare qualsiasi CSV da Google Drive dinamicamente**
+    
+    ## 🆕 Nuove funzionalità
+    
+    * 📤 **Caricamento dinamico** - Carica CSV al volo via API
+    * 🗑️ **Gestione tabelle** - Aggiungi e rimuovi tabelle in runtime
+    * ♻️ **Cache intelligente** - Evita download ripetuti dello stesso file
+    * 🔗 **Query diretta da URL** - Interroga CSV senza pre-caricamento
     
     ## Funzionalità principali
     
@@ -484,6 +573,37 @@ app = FastAPI(
     * 📈 **Aggregazioni statistiche** (media, mediana, max, min)
     * 📅 **Analisi temporali** (medie mobili, medie annuali)
     * 🎯 **Filtri pre-aggregazione** per analisi mirate
+    
+    ## 🎯 Come usare
+    
+    ### 1️⃣ Carica un CSV:
+    ```bash
+    POST /tables/load
+    {
+        "table_name": "my_data",
+        "gdrive_url": "https://drive.google.com/file/d/YOUR_FILE_ID/view",
+        "date_column": "date"
+    }
+    ```
+    
+    ### 2️⃣ Interroga i dati:
+    ```bash
+    POST /tables/my_data/query
+    {
+        "columns": ["date", "temperature"],
+        "limit": 100
+    }
+    ```
+    
+    ### 3️⃣ Oppure interroga direttamente da URL:
+    ```bash
+    POST /query/direct
+    {
+        "gdrive_url": "https://drive.google.com/file/d/YOUR_FILE_ID/view",
+        "columns": ["date", "temperature"],
+        "limit": 100
+    }
+    ```
     
     ## Operatori di filtro disponibili
     
@@ -495,12 +615,8 @@ app = FastAPI(
     * `lte`: minore o uguale a
     * `in`: contenuto in una lista
     * `contains`: contiene (per stringhe)
-    
-    ## Esempi d'uso
-    
-    Prova direttamente gli endpoint dalla sezione **"Try it out"** qui sotto! 👇
     """,
-    version="2.0.0",
+    version="3.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -527,14 +643,23 @@ data_manager = DataManager()
 def root():
     """Informazioni sull'API"""
     return {
-        "name": "CSV Data API",
-        "version": "2.0.0",
-        "description": "API for querying CSV datasets from Google Drive",
+        "name": "CSV Data API - Dynamic Loader",
+        "version": "3.0.0",
+        "description": "API for querying any CSV from Google Drive dynamically",
         "documentation": "/docs",
+        "new_features": {
+            "load_csv": "POST /tables/load - Load CSV from Google Drive",
+            "remove_table": "DELETE /tables/{table_name} - Remove table from memory",
+            "query_direct": "POST /query/direct - Query CSV directly from URL"
+        },
         "endpoints": {
             "tables": {
                 "url": "/tables",
-                "description": "List all available tables"
+                "description": "List all loaded tables"
+            },
+            "load": {
+                "url": "POST /tables/load",
+                "description": "Load new CSV from Google Drive"
             },
             "schema": {
                 "url": "/tables/{table_name}/schema",
@@ -551,16 +676,168 @@ def root():
         }
     }
 
+# 🆕 NUOVO ENDPOINT: Carica CSV dinamicamente
+@app.post("/tables/load",
+    tags=["Tables"],
+    summary="🆕 Carica CSV da Google Drive",
+    description="""
+    Carica un nuovo CSV da Google Drive nella memoria dell'API.
+    
+    **Come ottenere l'URL di Google Drive:**
+    1. Carica il file su Google Drive
+    2. Fai click destro → "Get link" / "Ottieni link"
+    3. Assicurati che sia impostato su "Anyone with the link" / "Chiunque abbia il link"
+    4. Copia l'URL (es: `https://drive.google.com/file/d/ABC123/view`)
+    
+    **Esempio:**
+    ```json
+    {
+        "table_name": "pollution_data",
+        "gdrive_url": "https://drive.google.com/file/d/1BJrfprXh1picyTQusVO6oW5zRxWQ_up7/view",
+        "date_column": "reftime",
+        "overwrite": false
+    }
+    ```
+    """,
+    response_description="Conferma del caricamento con informazioni sulla tabella"
+)
+def load_csv_from_gdrive(request: LoadCSVRequest):
+    """Carica un nuovo CSV da Google Drive"""
+    try:
+        # Controlla se la tabella esiste già
+        if request.table_name in data_manager.tables and not request.overwrite:
+            raise HTTPException(
+                status_code=409, 
+                detail=f"Table '{request.table_name}' already exists. Set overwrite=true to replace it."
+            )
+        
+        # Carica il CSV
+        data_manager.add_csv_from_gdrive(
+            table_name=request.table_name,
+            gdrive_url=request.gdrive_url,
+            date_column=request.date_column
+        )
+        
+        # Restituisci informazioni sulla tabella caricata
+        df = data_manager.tables[request.table_name]
+        
+        return {
+            "status": "success",
+            "message": f"Table '{request.table_name}' loaded successfully",
+            "table_info": {
+                "name": request.table_name,
+                "rows": len(df),
+                "columns": len(df.columns),
+                "column_names": list(df.columns),
+                "date_column": data_manager.date_columns.get(request.table_name),
+                "source": request.gdrive_url
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error loading CSV: {str(e)}")
+
+# 🆕 NUOVO ENDPOINT: Rimuovi tabella
+@app.delete("/tables/{table_name}",
+    tags=["Tables"],
+    summary="🆕 Rimuovi tabella",
+    description="Rimuove una tabella dalla memoria dell'API"
+)
+def remove_table(table_name: str):
+    """Rimuove una tabella dalla memoria"""
+    if data_manager.remove_table(table_name):
+        return {
+            "status": "success",
+            "message": f"Table '{table_name}' removed successfully"
+        }
+    else:
+        raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
+
+# 🆕 NUOVO ENDPOINT: Query diretta da URL
+@app.post("/query/direct",
+    tags=["Query"],
+    summary="🆕 Query diretta da URL",
+    description="""
+    Interroga un CSV direttamente da Google Drive senza doverlo caricare prima.
+    
+    Il file viene scaricato e messo in cache automaticamente. Le richieste successive
+    sullo stesso URL useranno la versione cached.
+    
+    **Esempio:**
+    ```json
+    {
+        "gdrive_url": "https://drive.google.com/file/d/1BJrfprXh1picyTQusVO6oW5zRxWQ_up7/view",
+        "date_column_hint": "reftime",
+        "columns": ["reftime", "lat", "lon"],
+        "filters": [
+            {"column": "lat", "operator": "gt", "value": 40}
+        ],
+        "limit": 100
+    }
+    ```
+    """
+)
+def query_direct_from_url(query_request: QueryRequest):
+    """Interroga un CSV direttamente da URL (con cache)"""
+    if not query_request.gdrive_url:
+        raise HTTPException(status_code=400, detail="gdrive_url is required for direct query")
+    
+    try:
+        # Ottieni o carica la tabella
+        table_name = data_manager.get_or_load_from_url(
+            gdrive_url=query_request.gdrive_url,
+            date_column=query_request.date_column_hint
+        )
+        
+        # Esegui la query
+        result = data_manager.query_table(table_name, query_request)
+        result["cached_table"] = table_name
+        
+        return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# 🆕 NUOVO ENDPOINT: Aggregazione diretta da URL
+@app.post("/aggregate/direct",
+    tags=["Aggregation"],
+    summary="🆕 Aggregazione diretta da URL",
+    description="Calcola aggregazioni su un CSV direttamente da Google Drive"
+)
+def aggregate_direct_from_url(agg_request: AggregationRequest):
+    """Aggrega dati direttamente da URL (con cache)"""
+    if not agg_request.gdrive_url:
+        raise HTTPException(status_code=400, detail="gdrive_url is required for direct aggregation")
+    
+    try:
+        # Ottieni o carica la tabella
+        table_name = data_manager.get_or_load_from_url(
+            gdrive_url=agg_request.gdrive_url,
+            date_column=agg_request.date_column_hint
+        )
+        
+        # Esegui l'aggregazione
+        result = data_manager.aggregate_column(table_name, agg_request)
+        result["cached_table"] = table_name
+        
+        return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @app.get("/tables",
     tags=["Tables"],
     summary="Lista tutte le tabelle",
-    description="Restituisce l'elenco di tutte le tabelle disponibili con informazioni di base",
+    description="Restituisce l'elenco di tutte le tabelle caricate in memoria",
     response_model=Dict[str, List[TableInfo]]
 )
 def list_tables():
     """Elenca tutte le tabelle disponibili"""
     return {
-        "tables": data_manager.get_table_list()
+        "tables": data_manager.get_table_list(),
+        "count": len(data_manager.tables)
     }
 
 @app.get("/tables/{table_name}/schema",
@@ -776,39 +1053,35 @@ def aggregate_column_get(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# ===== CONFIGURAZIONE INIZIALE =====
+# ===== CONFIGURAZIONE INIZIALE (OPZIONALE) =====
 
-def load_datasets():
-    """Carica i dataset all'avvio del server"""
+def load_default_datasets():
+    """
+    🆕 OPZIONALE: Carica dataset di default all'avvio
     
-    # 🔧 CONFIGURA QUI I TUOI DATASET
+    Puoi commentare questa funzione se vuoi caricare SOLO dataset dinamici via API
+    """
     
-    # Esempio 1: CSV da Google Drive
-    data_manager.add_csv_from_gdrive(
-         table_name="pollini",
-         gdrive_url="https://drive.google.com/file/d/1BJrfprXh1picyTQusVO6oW5zRxWQ_up7/view?usp=sharing",
-         date_column="reftime"
-     )
-    
-    # Esempio 2: CSV locale per testing
-    # data_manager.add_csv_from_file(
-    #     table_name="test_data",
-    #     file_path="data/test.csv",
-    #     date_column="timestamp"
+    # Esempio: carica un dataset di default
+    # data_manager.add_csv_from_gdrive(
+    #     table_name="pollini",
+    #     gdrive_url="https://drive.google.com/file/d/1BJrfprXh1picyTQusVO6oW5zRxWQ_up7/view?usp=sharing",
+    #     date_column="reftime"
     # )
     
-    print("✅ All datasets loaded successfully!")
+    print("✅ Default datasets loaded (if any)")
 
 @app.on_event("startup")
 async def startup_event():
     """Eseguito all'avvio del server"""
     print("\n" + "="*60)
-    print("🚀 Starting CSV Data API Server...")
+    print("🚀 Starting CSV Data API Server - Dynamic Loader v3.0")
     print("="*60)
-    load_datasets()
+    load_default_datasets()  # Commenta se non vuoi dataset di default
     print("="*60)
     print("📚 API Documentation: http://localhost:8000/docs")
     print("📖 Alternative docs: http://localhost:8000/redoc")
+    print("💡 Use POST /tables/load to load CSV dynamically")
     print("="*60 + "\n")
 
 if __name__ == "__main__":
